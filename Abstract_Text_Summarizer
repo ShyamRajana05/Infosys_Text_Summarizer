@@ -1,0 +1,255 @@
+# ================================
+# Step 1: Set up environment
+# ================================
+!pip -q install transformers PyPDF2 spacy torch streamlit pyngrok
+
+import os
+import time
+import multiprocessing
+import spacy
+from transformers import pipeline
+import PyPDF2
+import streamlit as st
+from pyngrok import ngrok
+
+# ================================
+# Step 2: Load SpaCy model safely
+# ================================
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    import spacy.cli
+    spacy.cli.download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
+
+# ================================
+# Step 3: Initialize summarizer
+# ================================
+def init_pipeline():
+    try:
+        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+        return summarizer
+    except RuntimeError as e:
+        return str(e)
+
+summarizer = init_pipeline()
+
+if isinstance(summarizer, str):
+    print('Error Initializing Pipeline:', summarizer)
+else:
+    print('Pipeline Initialized Successfully')
+
+# ================================
+# Step 4: Helper functions
+# ================================
+def safe_lengths(input_words, hard_max=512):
+    """Ensure valid min/max lengths for summarizer."""
+    min_len = max(5, int(0.2 * input_words))
+    max_len = min(hard_max, max(min_len + 5, input_words + 10))
+    if min_len >= max_len:
+        min_len = max(5, max_len - 5)
+    return min_len, max_len
+
+def chunk_text_by_words(text, chunk_size=600, overlap=80):
+    """Split text into smaller chunks for summarization."""
+    words = text.split()
+    if len(words) <= chunk_size:
+        return [text]
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i:i+chunk_size]
+        chunks.append(" ".join(chunk))
+        i += chunk_size - overlap
+    return chunks
+
+# ================================
+# Step 5: Hybrid summarizer
+# ================================
+def hybrid_summarize(text):
+    doc = nlp(text)
+    sentences = list(doc.sents)
+
+    if not sentences:
+        return "No content to summarize."
+
+    # Extractive step: longest 5 sentences
+    extracted_sentences = sorted(sentences, key=lambda s: len(s), reverse=True)[:5]
+    extracted_summary = ' '.join([s.text.strip() for s in extracted_sentences])
+
+    # Abstractive step: chunk if necessary
+    chunks = chunk_text_by_words(extracted_summary, chunk_size=600, overlap=80)
+    out_summaries = []
+    for ch in chunks:
+        words = len(ch.split())
+        min_length, max_length = safe_lengths(words)
+        summary = summarizer(
+            ch,
+            max_length=max_length,
+            min_length=min_length,
+            do_sample=False,
+            num_beams=4
+        )[0]['summary_text']
+        out_summaries.append(summary)
+
+    # Combine partials & final summarization
+    combined = " ".join(out_summaries)
+    words = len(combined.split())
+    min_length, max_length = safe_lengths(words)
+    final = summarizer(
+        combined,
+        max_length=max_length,
+        min_length=min_length,
+        do_sample=False,
+        num_beams=4
+    )[0]['summary_text']
+
+    return final
+
+# ================================
+# Step 6: PDF text extraction
+# ================================
+def extract_text_from_pdf(file):
+    reader = PyPDF2.PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        try:
+            text += (page.extract_text() or "") + '\n'
+        except:
+            pass
+    return text.strip()
+
+# ================================
+# Step 7: Write Streamlit app
+# ================================
+with open('app.py', 'w', encoding='utf-8') as f:
+    f.write('''
+import spacy
+from transformers import pipeline
+import PyPDF2
+import streamlit as st
+
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    import spacy.cli
+    spacy.cli.download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
+
+summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+
+def safe_lengths(input_words, hard_max=512):
+    min_len = max(5, int(0.2 * input_words))
+    max_len = min(hard_max, max(min_len + 5, input_words + 10))
+    if min_len >= max_len:
+        min_len = max(5, max_len - 5)
+    return min_len, max_len
+
+def chunk_text_by_words(text, chunk_size=600, overlap=80):
+    words = text.split()
+    if len(words) <= chunk_size:
+        return [text]
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i:i+chunk_size]
+        chunks.append(" ".join(chunk))
+        i += chunk_size - overlap
+    return chunks
+
+def hybrid_summarize(text):
+    doc = nlp(text)
+    sentences = list(doc.sents)
+    if not sentences:
+        return "No content to summarize."
+    extracted_sentences = sorted(sentences, key=lambda s: len(s), reverse=True)[:5]
+    extracted_summary = ' '.join([s.text.strip() for s in extracted_sentences])
+
+    chunks = chunk_text_by_words(extracted_summary, chunk_size=600, overlap=80)
+    summaries = []
+    for ch in chunks:
+        words = len(ch.split())
+        min_length, max_length = safe_lengths(words)
+        summary = summarizer(ch, max_length=max_length, min_length=min_length, do_sample=False, num_beams=4)[0]['summary_text']
+        summaries.append(summary)
+
+    combined = " ".join(summaries)
+    words = len(combined.split())
+    min_length, max_length = safe_lengths(words)
+    final = summarizer(combined, max_length=max_length, min_length=min_length, do_sample=False, num_beams=4)[0]['summary_text']
+    return final
+
+def extract_text_from_pdf(file):
+    reader = PyPDF2.PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        try:
+            text += (page.extract_text() or "") + '\\n'
+        except:
+            pass
+    return text.strip()
+
+st.title("Abstract Text Summarizer")
+
+option = st.radio("Choose an input method", ("Paste Text", "Upload PDF"))
+
+if option == "Paste Text":
+    input_text = st.text_area("Enter the text you want to summarize:")
+    if st.button("Summarize"):
+        if input_text.strip():
+            with st.spinner('Generating summary...'):
+                summary = hybrid_summarize(input_text)
+            st.subheader("Summary")
+            st.write(summary)
+        else:
+            st.warning("Please enter some text.")
+
+elif option == "Upload PDF":
+    uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
+    if uploaded_file is not None:
+        pdf_text = extract_text_from_pdf(uploaded_file)
+        st.subheader("PDF Content")
+        st.write(pdf_text if pdf_text else "(No extractable text found.)")
+        if pdf_text and st.button("Summarize PDF"):
+            with st.spinner('Generating summary...'):
+                summary = hybrid_summarize(pdf_text)
+            st.subheader("Summary")
+            st.write(summary)
+''')
+
+# ================================
+# Step 8: Ngrok authentication (embedded fix)
+# ================================
+token = os.getenv("NGROK_AUTHTOKEN")
+
+# If token not set in environment, you can hardcode it here:
+if not token:
+    token = "2q1TEP0sMns2s5a4qhkyuuKKGgU_FxQSL8YK1pSecg2zUwxH"  # Replace with your token
+
+if token:
+    try:
+        ngrok.set_auth_token(token)
+        print("Ngrok authentication successful.")
+    except Exception as e:
+        print(f"Ngrok token error: {e}")
+else:
+    print("ERROR: No NGROK_AUTHTOKEN provided. App will run locally only.")
+
+# ================================
+# Step 9: Run Streamlit app
+# ================================
+def run_streamlit():
+    os.system('streamlit run app.py --server.port 8501 --server.address 0.0.0.0')
+
+p = multiprocessing.Process(target=run_streamlit)
+p.start()
+
+time.sleep(5)  # wait for Streamlit to start
+
+try:
+    public_url = ngrok.connect(addr=8501, proto="http")
+    print(f"Open this URL to view the app: {public_url}")
+except Exception as e:
+    print(f"Error connecting to ngrok: {e}")
+
+p.join()
